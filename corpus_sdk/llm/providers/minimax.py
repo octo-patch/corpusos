@@ -7,7 +7,7 @@ This module implements a concrete ``BaseLLMAdapter`` that talks to the
 MiniMax text model HTTP API. MiniMax exposes an OpenAI-compatible
 ``/chat/completions`` surface at both the global endpoint
 (``https://api.minimax.io/v1``) and the China endpoint
-(``https://api.minimaxi.com/v1``), as well as an Anthropic-compatible
+(``https://api.minimax.cn/v1``), as well as an Anthropic-compatible
 endpoint. This adapter uses the OpenAI-compatible surface so that streaming,
 tool calling, and token accounting map cleanly onto ``LLMCompletion`` /
 ``LLMChunk``.
@@ -40,15 +40,11 @@ import os
 import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator, Awaitable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Any,
     Callable,
-    Dict,
-    List,
     Optional,
-    Tuple,
-    Union,
 )
 
 from corpus_sdk.llm.llm_base import (
@@ -83,24 +79,50 @@ class MiniMaxModelSpec:
 
     model_id: str
     context_window: int
-    input_modalities: Tuple[str, ...]
-    thinking: Tuple[str, ...]
-    pricing_usd_per_million_tokens: Mapping[str, Optional[float]]
+    input_modalities: tuple[str, ...]
+    thinking: tuple[str, ...]
+    pricing_usd_per_million_tokens: Mapping[str, float | None]
+    max_output_tokens: int | None = None
+    long_context_pricing_usd_per_million_tokens: Mapping[str, float] | None = None
 
 
-MINIMAX_MODELS: Tuple[MiniMaxModelSpec, ...] = (
+# Direct API standard pricing; M3's higher tier applies above 512k input tokens.
+# https://platform.minimax.io/docs/pricing/overview
+MINIMAX_MODELS: tuple[MiniMaxModelSpec, ...] = (
+    MiniMaxModelSpec(
+        model_id="MiniMax-M3.1-Flash",
+        context_window=1000000,
+        input_modalities=("text", "image", "video"),
+        thinking=("adaptive",),
+        pricing_usd_per_million_tokens={
+            "input": 0.15,
+            "output": 0.6,
+            "cache_read": 0.015,
+            "cache_write": None,
+        },
+        max_output_tokens=524288,
+    ),
     MiniMaxModelSpec(
         model_id="MiniMax-M3",
         context_window=1000000,
         input_modalities=("text", "image", "video"),
         thinking=("adaptive", "disabled"),
         pricing_usd_per_million_tokens={
+            "input": 0.3,
+            "output": 1.2,
+            "cache_read": 0.06,
+            "cache_write": None,
+        },
+        long_context_pricing_usd_per_million_tokens={
             "input": 0.6,
             "output": 2.4,
             "cache_read": 0.12,
-            "cache_write": None,
         },
     ),
+)
+
+# Explicit existing selections remain usable, but are not ordinary catalog choices.
+_LEGACY_MODELS: tuple[MiniMaxModelSpec, ...] = (
     MiniMaxModelSpec(
         model_id="MiniMax-M2.7",
         context_window=204800,
@@ -119,7 +141,7 @@ MINIMAX_MODELS: Tuple[MiniMaxModelSpec, ...] = (
 # MiniMax regional endpoints
 #
 # The global deployment (api.minimax.io) and the China deployment
-# (api.minimaxi.com) expose OpenAI- and Anthropic-compatible roots.
+# (api.minimax.cn) expose OpenAI- and Anthropic-compatible roots.
 # ---------------------------------------------------------------------------
 
 MINIMAX_REGIONS: Mapping[str, Mapping[str, str]] = {
@@ -129,14 +151,14 @@ MINIMAX_REGIONS: Mapping[str, Mapping[str, str]] = {
         "docs_root": "https://platform.minimax.io/docs",
     },
     "cn_zh": {
-        "openai_base_url": "https://api.minimaxi.com/v1",
-        "anthropic_base_url": "https://api.minimaxi.com/anthropic",
+        "openai_base_url": "https://api.minimax.cn/v1",
+        "anthropic_base_url": "https://api.minimax.cn/anthropic",
         "docs_root": "https://platform.minimaxi.com/docs",
     },
 }
 
 DEFAULT_REGION = "global_en"
-DEFAULT_MODEL = "MiniMax-M3"
+DEFAULT_MODEL = "MiniMax-M3.1-Flash"
 SERVER = "minimax"
 VERSION = "1.0.0"
 MODEL_FAMILY = "minimax"
@@ -145,14 +167,14 @@ MODEL_FAMILY = "minimax"
 _MAX_CONTEXT = max(spec.context_window for spec in MINIMAX_MODELS)
 
 
-def _model_spec(model_id: str) -> Optional[MiniMaxModelSpec]:
-    for spec in MINIMAX_MODELS:
+def _model_spec(model_id: str) -> MiniMaxModelSpec | None:
+    for spec in MINIMAX_MODELS + _LEGACY_MODELS:
         if spec.model_id == model_id:
             return spec
     return None
 
 
-def _supported_model_ids() -> Tuple[str, ...]:
+def _supported_model_ids() -> tuple[str, ...]:
     return tuple(spec.model_id for spec in MINIMAX_MODELS)
 
 
@@ -176,7 +198,7 @@ async def _default_transport(
     method: str,
     url: str,
     headers: Mapping[str, str],
-    body: Optional[bytes],
+    body: bytes | None,
     stream: bool,
 ) -> TransportLines:
     """Stdlib ``urllib`` transport wrapped in a worker thread.
@@ -228,6 +250,20 @@ def _map_http_error(code: int, reason: str) -> Exception:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class MiniMaxCompletion(LLMCompletion):
+    """Completion with the full assistant message for lossless history replay."""
+
+    message: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class MiniMaxChunk(LLMChunk):
+    """Chunk retaining raw reasoning and indexed tool-call deltas."""
+
+    delta: dict[str, Any] = field(default_factory=dict)
+
+
 class MiniMaxAdapter(BaseLLMAdapter):
     """Concrete MiniMax adapter implementing :class:`LLMProtocolV1`.
 
@@ -240,8 +276,13 @@ class MiniMaxAdapter(BaseLLMAdapter):
         One of the keys in :data:`MINIMAX_REGIONS` (``global_en`` or
         ``cn_zh``). Selects the deployment the adapter targets.
     model:
-        Default model id used when callers omit ``model=``. Must be one of
-        :data:`MINIMAX_MODELS`.
+        Default model id used when callers omit ``model=``. Defaults to Flash.
+        Explicit legacy MiniMax-M2.7 selections remain supported.
+    reasoning_effort:
+        Flash thinking depth: low, medium, high, xhigh or max. Omitted uses the
+        API default (max). Not sent for M3 or legacy models.
+    thinking:
+        Optional adaptive or disabled mode. Flash requires adaptive thinking.
     transport:
         Optional async callable replacing the default stdlib HTTP transport.
         Useful for tests and offline environments.
@@ -250,13 +291,15 @@ class MiniMaxAdapter(BaseLLMAdapter):
     def __init__(
         self,
         *,
-        api_key: Optional[str] = None,
+        api_key: str | None = None,
         region: str = DEFAULT_REGION,
         model: str = DEFAULT_MODEL,
-        transport: Optional[TransportCallable] = None,
-        metrics: Optional[MetricsSink] = None,
+        reasoning_effort: str | None = None,
+        thinking: str | None = None,
+        transport: TransportCallable | None = None,
+        metrics: MetricsSink | None = None,
         mode: str = "thin",
-        deadline_policy: Optional[DeadlinePolicy] = None,
+        deadline_policy: DeadlinePolicy | None = None,
         tag_model_in_metrics: bool = True,
         cache_ttl_s: int = 60,
         stream_deadline_check_every_n_chunks: int = 10,
@@ -265,6 +308,12 @@ class MiniMaxAdapter(BaseLLMAdapter):
             raise BadRequest(f"unknown MiniMax region: {region!r}")
         if _model_spec(model) is None:
             raise BadRequest(f"unknown MiniMax model: {model!r}")
+        if reasoning_effort not in (None, "low", "medium", "high", "xhigh", "max"):
+            raise BadRequest("reasoning_effort must be low, medium, high, xhigh or max")
+        if thinking not in (None, "adaptive", "disabled"):
+            raise BadRequest("thinking must be adaptive or disabled")
+        self._reasoning_effort = reasoning_effort
+        self._thinking = thinking
 
         super().__init__(
             metrics=metrics,
@@ -291,14 +340,42 @@ class MiniMaxAdapter(BaseLLMAdapter):
     def _openai_base_url(self) -> str:
         return MINIMAX_REGIONS[self._region]["openai_base_url"]
 
-    def _resolve_model(self, model: Optional[str]) -> str:
+    def _resolve_model(self, model: str | None) -> str:
         resolved = model or self._default_model
         spec = _model_spec(resolved)
         if spec is None:
             raise BadRequest(f"unknown MiniMax model: {resolved!r}")
         return resolved
 
-    def _auth_headers(self) -> Dict[str, str]:
+    def _gate_model_if_listed(self, *, model: str | None, caps: LLMCapabilities) -> None:
+        # The public catalog lists current choices; saved legacy IDs still resolve.
+        self._resolve_model(model)
+
+    @staticmethod
+    def _validate_messages(messages: list[Mapping[str, Any]]) -> None:
+        # Extend the text-only protocol validator locally for MiniMax content parts
+        # and assistant tool calls with null content; never rewrite the actual history.
+        validation_messages: list[Mapping[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, Mapping):
+                raise BadRequest("each message must be a mapping")
+            content = message.get("content")
+            if isinstance(content, list):
+                if not all(
+                    isinstance(part, Mapping) and isinstance(part.get("type"), str)
+                    for part in content
+                ):
+                    raise BadRequest("content parts must be mappings with a string type")
+                validation_messages.append({**message, "content": ""})
+            elif (
+                content is None and message.get("role") == "assistant" and message.get("tool_calls")
+            ):
+                validation_messages.append({**message, "content": ""})
+            else:
+                validation_messages.append(message)
+        BaseLLMAdapter._validate_messages(validation_messages)
+
+    def _auth_headers(self) -> dict[str, str]:
         token = self._api_key or ""
         return {
             "Authorization": f"Bearer {token}",
@@ -307,10 +384,10 @@ class MiniMaxAdapter(BaseLLMAdapter):
 
     @staticmethod
     def _build_messages(
-        messages: List[Mapping[str, Any]],
-        system_message: Optional[str],
-    ) -> List[Dict[str, Any]]:
-        out: List[Dict[str, Any]] = []
+        messages: list[Mapping[str, Any]],
+        system_message: str | None,
+    ) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
         if system_message:
             out.append({"role": "system", "content": system_message})
         out.extend({k: v for k, v in m.items()} for m in messages)
@@ -318,9 +395,9 @@ class MiniMaxAdapter(BaseLLMAdapter):
 
     @staticmethod
     def _parse_tool_calls(
-        raw_calls: Optional[List[Mapping[str, Any]]],
-    ) -> List[ToolCall]:
-        calls: List[ToolCall] = []
+        raw_calls: list[Mapping[str, Any]] | None,
+    ) -> list[ToolCall]:
+        calls: list[ToolCall] = []
         for raw in raw_calls or []:
             fn = raw.get("function") or {}
             calls.append(
@@ -338,24 +415,31 @@ class MiniMaxAdapter(BaseLLMAdapter):
     def _build_payload(
         self,
         *,
-        messages: List[Mapping[str, Any]],
+        messages: list[Mapping[str, Any]],
         model: str,
-        max_tokens: Optional[int],
-        temperature: Optional[float],
-        top_p: Optional[float],
-        frequency_penalty: Optional[float],
-        presence_penalty: Optional[float],
-        stop_sequences: Optional[List[str]],
-        system_message: Optional[str],
-        tools: Optional[List[Dict[str, Any]]],
-        tool_choice: Optional[Union[str, Dict[str, Any]]],
+        max_tokens: int | None,
+        temperature: float | None,
+        top_p: float | None,
+        frequency_penalty: float | None,
+        presence_penalty: float | None,
+        stop_sequences: list[str] | None,
+        system_message: str | None,
+        tools: list[dict[str, Any]] | None,
+        tool_choice: str | dict[str, Any] | None,
         stream: bool,
-    ) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
             "model": model,
             "messages": self._build_messages(messages, system_message),
             "stream": stream,
         }
+        if model == "MiniMax-M3.1-Flash":
+            if self._thinking == "disabled":
+                raise BadRequest("MiniMax-M3.1-Flash requires adaptive thinking")
+            if self._reasoning_effort is not None:
+                payload["reasoning_effort"] = self._reasoning_effort
+        if self._thinking is not None:
+            payload["thinking"] = {"type": self._thinking}
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
         if temperature is not None:
@@ -376,7 +460,7 @@ class MiniMaxAdapter(BaseLLMAdapter):
 
     async def _request_lines(
         self,
-        payload: Dict[str, Any],
+        payload: dict[str, Any],
         *,
         stream: bool,
     ) -> AsyncIterator[bytes]:
@@ -410,7 +494,7 @@ class MiniMaxAdapter(BaseLLMAdapter):
             supported_models=_supported_model_ids(),
         )
 
-    async def _do_health(self, *, ctx: Optional[OperationContext] = None) -> Mapping[str, Any]:
+    async def _do_health(self, *, ctx: OperationContext | None = None) -> Mapping[str, Any]:
         return {
             "ok": True,
             "status": "healthy",
@@ -427,18 +511,18 @@ class MiniMaxAdapter(BaseLLMAdapter):
     async def _do_complete(
         self,
         *,
-        messages: List[Mapping[str, str]],
-        max_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-        frequency_penalty: Optional[float] = None,
-        presence_penalty: Optional[float] = None,
-        stop_sequences: Optional[List[str]] = None,
-        model: Optional[str] = None,
-        system_message: Optional[str] = None,
-        tools: Optional[List[Dict[str, Any]]] = None,
-        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
-        ctx: Optional[OperationContext] = None,
+        messages: list[Mapping[str, str]],
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        frequency_penalty: float | None = None,
+        presence_penalty: float | None = None,
+        stop_sequences: list[str] | None = None,
+        model: str | None = None,
+        system_message: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        ctx: OperationContext | None = None,
     ) -> LLMCompletion:
         resolved = self._resolve_model(model)
         payload = self._build_payload(
@@ -483,7 +567,8 @@ class MiniMaxAdapter(BaseLLMAdapter):
         completion = int(usage_raw.get("completion_tokens") or 0)
         total = int(usage_raw.get("total_tokens") or (prompt + completion))
 
-        return LLMCompletion(
+        return MiniMaxCompletion(
+            message=dict(message),
             text=text,
             model=resolved_model,
             model_family=MODEL_FAMILY,
@@ -503,18 +588,18 @@ class MiniMaxAdapter(BaseLLMAdapter):
     async def _do_stream(
         self,
         *,
-        messages: List[Mapping[str, str]],
-        max_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-        frequency_penalty: Optional[float] = None,
-        presence_penalty: Optional[float] = None,
-        stop_sequences: Optional[List[str]] = None,
-        model: Optional[str] = None,
-        system_message: Optional[str] = None,
-        tools: Optional[List[Dict[str, Any]]] = None,
-        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
-        ctx: Optional[OperationContext] = None,
+        messages: list[Mapping[str, str]],
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        frequency_penalty: float | None = None,
+        presence_penalty: float | None = None,
+        stop_sequences: list[str] | None = None,
+        model: str | None = None,
+        system_message: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        ctx: OperationContext | None = None,
     ) -> AsyncIterator[LLMChunk]:
         resolved = self._resolve_model(model)
         payload = self._build_payload(
@@ -537,12 +622,12 @@ class MiniMaxAdapter(BaseLLMAdapter):
         saw_final = False
         async for chunk in _iter_sse_objects(lines):
             choices = chunk.get("choices") or []
-            delta = choices[0].get("delta") if choices else {}
+            delta = (choices[0].get("delta") or {}) if choices else {}
             text = str(delta.get("content") or "")
             finish_reason = choices[0].get("finish_reason") if choices else None
 
             usage_raw = chunk.get("usage")
-            usage: Optional[TokenUsage] = None
+            usage: TokenUsage | None = None
             if usage_raw:
                 p = int(usage_raw.get("prompt_tokens") or 0)
                 c = int(usage_raw.get("completion_tokens") or 0)
@@ -555,33 +640,47 @@ class MiniMaxAdapter(BaseLLMAdapter):
             is_final = bool(finish_reason) or usage is not None
             if is_final:
                 saw_final = True
-            yield LLMChunk(
+            yield MiniMaxChunk(
+                delta=dict(delta),
                 text=text,
                 is_final=is_final,
                 model=resolved,
                 usage_so_far=usage,
-                tool_calls=[],
+                tool_calls=self._parse_tool_calls(delta.get("tool_calls")),
             )
 
         # Guarantee a final sentinel chunk even if the upstream omitted one.
         if not saw_final:
-            yield LLMChunk(text="", is_final=True, model=resolved, usage_so_far=None)
+            yield MiniMaxChunk(text="", is_final=True, model=resolved, usage_so_far=None)
 
     # ------------------------------------------------------------------
     # Token counting
     # ------------------------------------------------------------------
 
+    async def count_tokens(
+        self,
+        text: str,
+        *,
+        model: str | None = None,
+        ctx: OperationContext | None = None,
+    ) -> int:
+        # Token estimation is model-independent. Keep legacy IDs usable despite
+        # the base wrapper's separate current-catalog membership check.
+        resolved = self._resolve_model(model)
+        listed_model = resolved if resolved in _supported_model_ids() else None
+        return await super().count_tokens(text, model=listed_model, ctx=ctx)
+
     async def _do_count_tokens(
         self,
         text: str,
         *,
-        model: Optional[str] = None,
-        ctx: Optional[OperationContext] = None,
+        model: str | None = None,
+        ctx: OperationContext | None = None,
     ) -> int:
         """Best-effort token approximation.
 
-        MiniMax does not expose a public token-counting endpoint, so the adapter
-        approximates with a whitespace + punctuation heuristic. Callers that
+        This Chat Completions adapter uses a local whitespace heuristic rather
+        than a separate token-counting request. Callers that
         need exact counts should use the ``usage`` field on ``LLMCompletion``.
         """
         if not text:
@@ -595,7 +694,7 @@ class MiniMaxAdapter(BaseLLMAdapter):
 
 
 async def _read_all(lines: AsyncIterator[bytes]) -> bytes:
-    chunks: List[bytes] = []
+    chunks: list[bytes] = []
     async for line in lines:
         chunks.append(line)
     return b"".join(chunks)
@@ -611,7 +710,7 @@ def _parse_json_body(body: bytes) -> Any:
         raise BadRequest(f"MiniMax returned non-JSON body: {exc.msg}") from exc
 
 
-async def _iter_sse_objects(lines: AsyncIterator[bytes]) -> AsyncIterator[Dict[str, Any]]:
+async def _iter_sse_objects(lines: AsyncIterator[bytes]) -> AsyncIterator[dict[str, Any]]:
     """Yield parsed JSON objects from a Server-Sent-Events byte stream."""
     pending = ""
     async for raw in lines:
@@ -634,7 +733,7 @@ async def _iter_sse_objects(lines: AsyncIterator[bytes]) -> AsyncIterator[Dict[s
             yield obj
 
 
-def _parse_sse_pending(pending: str) -> Optional[Dict[str, Any]]:
+def _parse_sse_pending(pending: str) -> dict[str, Any] | None:
     try:
         obj = json.loads(pending)
     except json.JSONDecodeError:

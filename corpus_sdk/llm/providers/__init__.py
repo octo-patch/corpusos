@@ -8,6 +8,18 @@ HTTP API while remaining wire-compatible with the vendor-neutral contract
 defined in :mod:`corpus_sdk.llm.llm_base`.
 """
 
-from corpus_sdk.llm.providers.minimax import MINIMAX_MODELS, MINIMAX_REGIONS, MiniMaxAdapter
+from corpus_sdk.llm.providers.minimax import (
+    MINIMAX_MODELS,
+    MINIMAX_REGIONS,
+    MiniMaxAdapter,
+    MiniMaxChunk,
+    MiniMaxCompletion,
+)
 
-__all__ = ["MiniMaxAdapter", "MINIMAX_MODELS", "MINIMAX_REGIONS"]
+__all__ = [
+    "MiniMaxAdapter",
+    "MiniMaxChunk",
+    "MiniMaxCompletion",
+    "MINIMAX_MODELS",
+    "MINIMAX_REGIONS",
+]

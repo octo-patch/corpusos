@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator, Mapping
-from typing import Dict, List, Optional
 
 import pytest
 
@@ -41,17 +40,17 @@ pytestmark = pytest.mark.asyncio
 class FakeTransport:
     """Records the last request and returns canned line streams."""
 
-    def __init__(self, *, lines: Optional[List[bytes]] = None, error: Optional[Exception] = None):
+    def __init__(self, *, lines: list[bytes] | None = None, error: Exception | None = None):
         self._lines = lines or []
         self._error = error
-        self.calls: List[Dict[str, object]] = []
+        self.calls: list[dict[str, object]] = []
 
     async def __call__(
         self,
         method: str,
         url: str,
         headers: Mapping[str, str],
-        body: Optional[bytes],
+        body: bytes | None,
         stream: bool,
     ) -> AsyncIterator[bytes]:
         self.calls.append(
@@ -78,9 +77,9 @@ def _completion_body(
     text: str = "hello",
     model: str = "MiniMax-M3",
     finish: str = "stop",
-    tool_calls: Optional[List[Dict]] = None,
+    tool_calls: list[dict] | None = None,
 ) -> bytes:
-    message: Dict[str, object] = {"role": "assistant", "content": text}
+    message: dict[str, object] = {"role": "assistant", "content": text}
     if tool_calls:
         message["tool_calls"] = tool_calls
     payload = {
@@ -98,8 +97,8 @@ def _completion_body(
     return (json.dumps(payload) + "\n").encode("utf-8")
 
 
-def _sse_lines(events: List[Dict]) -> List[bytes]:
-    out: List[bytes] = []
+def _sse_lines(events: list[dict]) -> list[bytes]:
+    out: list[bytes] = []
     for ev in events:
         out.append(b"data: " + json.dumps(ev).encode("utf-8") + b"\n")
         out.append(b"\n")
@@ -121,22 +120,28 @@ async def test_capabilities_advertise_models_and_contexts():
     assert caps.model_family == "minimax"
     assert caps.supports_streaming is True
     assert caps.supports_tools is True
-    assert "MiniMax-M3" in caps.supported_models
-    assert "MiniMax-M2.7" in caps.supported_models
+    assert caps.supported_models == ("MiniMax-M3.1-Flash", "MiniMax-M3")
     assert caps.max_context_length == 1000000
 
 
 async def test_registry_matches_capabilities():
     ids = [spec.model_id for spec in MINIMAX_MODELS]
-    assert ids == ["MiniMax-M3", "MiniMax-M2.7"]
-    m3 = MINIMAX_MODELS[0]
+    assert ids == ["MiniMax-M3.1-Flash", "MiniMax-M3"]
+    flash, m3 = MINIMAX_MODELS
+    assert flash.context_window == 1000000
+    assert flash.max_output_tokens == 524288
+    assert flash.thinking == ("adaptive",)
+    assert flash.pricing_usd_per_million_tokens == {
+        "input": 0.15,
+        "output": 0.6,
+        "cache_read": 0.015,
+        "cache_write": None,
+    }
     assert m3.context_window == 1000000
-    assert "image" in m3.input_modalities
-    assert "video" in m3.input_modalities
-    m27 = MINIMAX_MODELS[1]
-    assert m27.context_window == 204800
-    assert m27.input_modalities == ("text",)
-    assert m27.thinking == ("always_on",)
+    assert flash.input_modalities == m3.input_modalities == ("text", "image", "video")
+    assert m3.thinking == ("adaptive", "disabled")
+    assert m3.pricing_usd_per_million_tokens["input"] == 0.3
+    assert m3.long_context_pricing_usd_per_million_tokens["input"] == 0.6
 
 
 async def test_unknown_region_rejected():
@@ -153,7 +158,7 @@ async def test_regional_endpoints_cover_global_and_cn():
     assert "global_en" in MINIMAX_REGIONS
     assert "cn_zh" in MINIMAX_REGIONS
     assert MINIMAX_REGIONS["global_en"]["openai_base_url"].startswith("https://api.minimax.io")
-    assert MINIMAX_REGIONS["cn_zh"]["openai_base_url"].startswith("https://api.minimaxi.com")
+    assert MINIMAX_REGIONS["cn_zh"]["openai_base_url"].startswith("https://api.minimax.cn")
 
 
 async def test_region_selects_endpoint_url():
@@ -161,7 +166,7 @@ async def test_region_selects_endpoint_url():
     adapter = MiniMaxAdapter(api_key="k", region="cn_zh", transport=transport)
     await adapter.complete(messages=[{"role": "user", "content": "hi"}], model="MiniMax-M3")
     call = transport.calls[-1]
-    assert "api.minimaxi.com" in str(call["url"])
+    assert "api.minimax.cn" in str(call["url"])
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +281,7 @@ async def test_stream_yields_deltas_and_final_chunk():
     ]
     transport = FakeTransport(lines=_sse_lines(events))
     adapter = MiniMaxAdapter(api_key="k", transport=transport)
-    chunks: List[LLMChunk] = []
+    chunks: list[LLMChunk] = []
     async for chunk in adapter.stream(
         messages=[{"role": "user", "content": "hi"}], model="MiniMax-M3"
     ):
@@ -304,7 +309,7 @@ async def test_stream_handles_missing_choices_gracefully():
     events = [{"usage": {"prompt_tokens": 1, "completion_tokens": 0, "total_tokens": 1}}]
     transport = FakeTransport(lines=_sse_lines(events))
     adapter = MiniMaxAdapter(api_key="k", transport=transport)
-    chunks: List[LLMChunk] = []
+    chunks: list[LLMChunk] = []
     async for chunk in adapter.stream(messages=[{"role": "user", "content": "hi"}]):
         chunks.append(chunk)
     assert chunks[-1].is_final is True

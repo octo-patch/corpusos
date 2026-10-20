@@ -140,6 +140,36 @@ Python ≥ 3.10 recommended. No heavy runtime dependencies.
 
 ## ⚡ Quick Start
 
+### MiniMax provider
+
+`MiniMaxAdapter` uses the direct Chat Completions API with no additional runtime
+packages. Set `MINIMAX_API_KEY`, then call it from your async application:
+
+```python
+from corpus_sdk.llm.providers import MiniMaxAdapter
+
+adapter = MiniMaxAdapter(reasoning_effort="max")  # MiniMax-M3.1-Flash by default
+result = await adapter.complete(messages=[{"role": "user", "content": "Hello"}])
+```
+
+The current catalog lists `MiniMax-M3.1-Flash` first, then `MiniMax-M3`. Explicit
+`model="MiniMax-M2.7"` selections remain usable for existing applications.
+Use `region="cn_zh"` for `https://api.minimax.cn/v1`; the default `global_en` uses
+`https://api.minimax.io/v1`. These are direct API routes, not subscription gateways.
+
+Flash accepts `reasoning_effort` values `low`, `medium`, `high`, `xhigh`, and `max`
+(the API default). It requires adaptive thinking; `thinking="disabled"` is only
+usable with M3. Effort is omitted for M3 and legacy model requests.
+
+For tool conversations, append `result.message` to history unchanged before adding
+the tool result. It preserves `reasoning_content` and `tool_calls`, including null
+assistant content. Streaming returns `MiniMaxChunk.delta` with complete raw
+reasoning and indexed tool-call deltas; accumulate them when building the next
+assistant message. Image/video content parts pass through unchanged. Token counts
+remain local text estimates, not exact multimodal counts.
+
+### Implementing an adapter
+
 ```python
 import asyncio
 from corpus_sdk.llm.llm_base import (
