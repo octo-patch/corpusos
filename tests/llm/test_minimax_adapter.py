@@ -158,7 +158,7 @@ async def test_regional_endpoints_cover_global_and_cn():
     assert "global_en" in MINIMAX_REGIONS
     assert "cn_zh" in MINIMAX_REGIONS
     assert MINIMAX_REGIONS["global_en"]["openai_base_url"].startswith("https://api.minimax.io")
-    assert MINIMAX_REGIONS["cn_zh"]["openai_base_url"].startswith("https://api.minimax.cn")
+    assert MINIMAX_REGIONS["cn_zh"]["openai_base_url"].startswith("https://api.minimaxi.com")
 
 
 async def test_region_selects_endpoint_url():
@@ -166,7 +166,7 @@ async def test_region_selects_endpoint_url():
     adapter = MiniMaxAdapter(api_key="k", region="cn_zh", transport=transport)
     await adapter.complete(messages=[{"role": "user", "content": "hi"}], model="MiniMax-M3")
     call = transport.calls[-1]
-    assert "api.minimax.cn" in str(call["url"])
+    assert "api.minimaxi.com" in str(call["url"])
 
 
 # ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@ This module implements a concrete ``BaseLLMAdapter`` that talks to the
 MiniMax text model HTTP API. MiniMax exposes an OpenAI-compatible
 ``/chat/completions`` surface at both the global endpoint
 (``https://api.minimax.io/v1``) and the China endpoint
-(``https://api.minimax.cn/v1``), as well as an Anthropic-compatible
+(``https://api.minimaxi.com/v1``), as well as an Anthropic-compatible
 endpoint. This adapter uses the OpenAI-compatible surface so that streaming,
 tool calling, and token accounting map cleanly onto ``LLMCompletion`` /
 ``LLMChunk``.
@@ -141,7 +141,7 @@ _LEGACY_MODELS: tuple[MiniMaxModelSpec, ...] = (
 # MiniMax regional endpoints
 #
 # The global deployment (api.minimax.io) and the China deployment
-# (api.minimax.cn) expose OpenAI- and Anthropic-compatible roots.
+# (api.minimaxi.com) expose OpenAI- and Anthropic-compatible roots.
 # ---------------------------------------------------------------------------
 
 MINIMAX_REGIONS: Mapping[str, Mapping[str, str]] = {
@@ -151,8 +151,8 @@ MINIMAX_REGIONS: Mapping[str, Mapping[str, str]] = {
         "docs_root": "https://platform.minimax.io/docs",
     },
     "cn_zh": {
-        "openai_base_url": "https://api.minimax.cn/v1",
-        "anthropic_base_url": "https://api.minimax.cn/anthropic",
+        "openai_base_url": "https://api.minimaxi.com/v1",
+        "anthropic_base_url": "https://api.minimaxi.com/anthropic",
         "docs_root": "https://platform.minimaxi.com/docs",
     },
 }

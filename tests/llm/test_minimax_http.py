@@ -75,7 +75,7 @@ def http_calls(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "region,host", [("global_en", "api.minimax.io"), ("cn_zh", "api.minimax.cn")]
+    "region,host", [("global_en", "api.minimax.io"), ("cn_zh", "api.minimaxi.com")]
 )
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize(

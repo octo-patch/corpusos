@@ -154,7 +154,7 @@ result = await adapter.complete(messages=[{"role": "user", "content": "Hello"}])
 
 The current catalog lists `MiniMax-M3.1-Flash` first, then `MiniMax-M3`. Explicit
 `model="MiniMax-M2.7"` selections remain usable for existing applications.
-Use `region="cn_zh"` for `https://api.minimax.cn/v1`; the default `global_en` uses
+Use `region="cn_zh"` for `https://api.minimaxi.com/v1`; the default `global_en` uses
 `https://api.minimax.io/v1`. These are direct API routes, not subscription gateways.
 
 Flash accepts `reasoning_effort` values `low`, `medium`, `high`, `xhigh`, and `max`
